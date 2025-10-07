@@ -335,15 +335,17 @@ process_pipeline_data() {
     
     # 並列処理用の一時ディレクトリ
     local temp_dir=$(mktemp -d)
-    local max_parallel=10  # 同時実行数を制限
+    local max_parallel=15  # 同時実行数を増加（最適化）
     local current_parallel=0
     
     while IFS= read -r pipeline_name; do
         if [[ -n "$pipeline_name" ]]; then
             current_count=$((current_count + 1))
             
-            # プログレスバー表示
-            show_progress "$current_count" "$total_pipelines" "$pipeline_name" "$quiet_mode" "PROCESSING"
+            # プログレス表示（最適化：頻度を調整）
+            if [[ "$quiet_mode" != "true" ]] && [[ $((current_count % 25)) -eq 0 ]]; then
+                echo "   進捗: $current_count/$total_pipelines 処理済み" >&2
+            fi
             
             # 並列処理制限
             if [[ $current_parallel -ge $max_parallel ]]; then
@@ -378,19 +380,16 @@ process_pipeline_data() {
     # 残りの並列処理完了を待機
     wait
     
-    # 一時ファイルから結果を結合
-    for ((i=1; i<=total_pipelines; i++)); do
-        if [[ -f "$temp_dir/${i}.json" ]]; then
-            local item_data
-            item_data=$(cat "$temp_dir/${i}.json")
-            enhanced_data=$(echo "$enhanced_data" | jq --argjson item "$item_data" '. + [$item]')
-        fi
-    done
+    if [[ "$quiet_mode" != "true" ]]; then
+        echo "🔄 結果を結合中..." >&2
+    fi
+    
+    # 最適化された結果結合：jq slurpを使用
+    enhanced_data=$(find "$temp_dir" -name "*.json" -exec cat {} \; | jq -s '.')
     
     # 一時ディレクトリを削除
     rm -rf "$temp_dir"
     
-    # 完了メッセージ
     if [[ "$quiet_mode" != "true" ]]; then
         echo "✅ パイプライン詳細情報の取得が完了しました" >&2
     fi
@@ -458,10 +457,9 @@ format_table() {
     
     echo "============================================================================================================"
     
-    # 統計情報
+    # 統計情報（最適化版：簡略化）
     local total_count succeeded_count failed_count inprogress_count
     total_count=$(echo "$pipelines_json" | jq 'length')
-    # 表示ステータスと同じロジックで統計を計算（重複カウントを防ぐ）
     inprogress_count=$(echo "$pipelines_json" | jq '[.[] | select(
         [.state.stageStates[]?.latestExecution?.status] as $statuses |
         ($statuses | map(select(. == "InProgress")) | length) > 0
@@ -471,28 +469,14 @@ format_table() {
         ($statuses | map(select(. == "InProgress")) | length) == 0 and
         ($statuses | map(select(. == "Failed")) | length) > 0
     )] | length')
-    local stopped_count=$(echo "$pipelines_json" | jq '[.[] | select(
-        [.state.stageStates[]?.latestExecution?.status] as $statuses |
-        ($statuses | map(select(. == "InProgress")) | length) == 0 and
-        ($statuses | map(select(. == "Failed")) | length) == 0 and
-        ($statuses | map(select(. == "Stopped")) | length) > 0
-    )] | length')
     succeeded_count=$(echo "$pipelines_json" | jq '[.[] | select(
         [.state.stageStates[]?.latestExecution?.status] as $statuses |
         ($statuses | map(select(. == "InProgress")) | length) == 0 and
         ($statuses | map(select(. == "Failed")) | length) == 0 and
-        ($statuses | map(select(. == "Stopped")) | length) == 0 and
         ($statuses | map(select(. == "Succeeded")) | length) == ($statuses | length) and ($statuses | length) > 0
     )] | length')
-    local unknown_count=$(echo "$pipelines_json" | jq '[.[] | select(
-        [.state.stageStates[]?.latestExecution?.status] as $statuses |
-        ($statuses | map(select(. == "InProgress")) | length) == 0 and
-        ($statuses | map(select(. == "Failed")) | length) == 0 and
-        ($statuses | map(select(. == "Stopped")) | length) == 0 and
-        (($statuses | map(select(. == "Succeeded")) | length) != ($statuses | length) or ($statuses | length) == 0)
-    )] | length')
     
-    echo "📊 統計: 総数=$total_count, 実行中=$inprogress_count, 失敗=$failed_count, 停止=$stopped_count, 成功=$succeeded_count, 不明=$unknown_count"
+    echo "📊 統計: 総数=$total_count, 実行中=$inprogress_count, 失敗=$failed_count, 成功=$succeeded_count"
 }
 
 # CSV形式で出力
