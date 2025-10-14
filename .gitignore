@@ -1,1 +1,4 @@
 aws_cache/
+
+# 設定ファイル（個人のAWSプロファイル情報などが含まれるため）
+aot_config.conf

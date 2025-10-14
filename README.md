@@ -41,6 +41,15 @@
 
 ## ⚡ クイックスタート
 
+### 初期設定
+```bash
+# 設定ファイルを作成
+cp aot_config.example.conf aot_config.conf
+
+# 設定ファイルを編集（AWSプロファイルなどを設定）
+vi aot_config.conf
+```
+
 ### 基本的な使用方法
 ```bash
 # パイプライン一覧を表示

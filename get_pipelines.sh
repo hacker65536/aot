@@ -9,6 +9,7 @@ set -euo pipefail
 # スクリプトのディレクトリを取得
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AWS_CACHE_SCRIPT="$SCRIPT_DIR/aws_cache.sh"
+CONFIG_FILE="$SCRIPT_DIR/aot_config.conf"
 
 # aws_cache.shの存在確認
 if [[ ! -f "$AWS_CACHE_SCRIPT" ]]; then
@@ -23,6 +24,24 @@ if [[ ! -x "$AWS_CACHE_SCRIPT" ]]; then
     echo "💡 解決方法: chmod +x $AWS_CACHE_SCRIPT" >&2
     exit 1
 fi
+
+# 設定ファイルを読み込む関数
+load_config() {
+    local config_file="$1"
+    
+    # 設定ファイルが存在しない場合はデフォルト値を使用
+    if [[ ! -f "$config_file" ]]; then
+        echo "⚠️  設定ファイルが見つかりません: $config_file" >&2
+        echo "💡 デフォルト設定を使用します。設定ファイルを作成する場合:" >&2
+        echo "   cp aot_config.example.conf aot_config.conf" >&2
+        return 1
+    fi
+    
+    # Bash変数形式の設定ファイルを読み込み
+    # shellcheck source=/dev/null
+    source "$config_file"
+    return 0
+}
 
 # キャッシュ利用状況を分析
 analyze_cache_usage() {
@@ -182,14 +201,18 @@ show_progress() {
         "HIT") cache_icon="🟢" ;;
         "MISS") cache_icon="🔴" ;;
         "PROCESSING") cache_icon="🔄" ;;
+        "COMPLETED") cache_icon="✅" ;;
         *) cache_icon="⚪" ;;
     esac
     
     # 進捗表示（カーソルを行の先頭に戻して上書き）
-    printf "\r%s パイプライン詳細取得中 [%s] %d/%d (%d%%) - %s" "$cache_icon" "$bar" "$current" "$total" "$percentage" "${pipeline_name:0:25}" >&2
+    # 行をクリアしてから表示（前の文字が残らないように）
+    # パイプライン名を固定幅（25文字）で表示
+    local display_name="${pipeline_name:0:25}"
+    printf "\r\033[K%s パイプライン詳細取得中 [%s] %d/%d (%d%%) - %-25s" "$cache_icon" "$bar" "$current" "$total" "$percentage" "$display_name" >&2
     
-    # 完了時は改行
-    if [[ $current -eq $total ]]; then
+    # 完了時は改行（ただし、COMPLETEDステータスの場合は改行する）
+    if [[ $current -eq $total && "$cache_status" == "COMPLETED" ]]; then
         echo >&2
     fi
 }
@@ -205,12 +228,18 @@ AWS CodePipeline 一覧取得
 このスクリプトは aws_cache.sh を利用してAPIレスポンスをキャッシュします。
 同じ条件での再実行時は高速にデータを取得できます。
 
+設定ファイル:
+  aot_config.conf でデフォルト設定を変更できます。
+  設定ファイルがない場合は aot_config.example.conf をコピーしてください。
+
 オプション:
   -f, --format FORMAT   出力形式 (table|json|csv) [デフォルト: table]
   -s, --status STATUS   ステータスフィルター (ALL|Succeeded|Failed|InProgress|Stopped) [デフォルト: ALL]
+                       設定ファイルのPIPELINES_DEFAULT_STATUSでデフォルト値を設定可能
   -c, --cache-ttl TTL   キャッシュ有効期限（秒） [デフォルト: 1800]
   -r, --region REGION   AWSリージョン [デフォルト: 現在の設定]
   --query QUERY        AWS CLIクエリフィルター [例: 'pipelines[?ends_with(name, \`-customizations-pipeline\`)]']
+                       設定ファイルのPIPELINES_DEFAULT_QUERYでデフォルト値を設定可能
   -q, --quiet          プログレスバーを非表示
   --analyze-cache      キャッシュ利用状況を詳細分析（通常出力をスキップしてキャッシュ分析のみ実行）
   -d, --debug          デバッグモード（aws_cache.shのデバッグログも表示）
@@ -227,6 +256,10 @@ AWS CodePipeline 一覧取得
   $0 -q                        # プログレスバー非表示で実行
   $0 --analyze-cache           # キャッシュ利用状況を詳細分析（通常出力なし）
   
+設定ファイル例:
+  cp aot_config.example.conf aot_config.conf
+  # aot_config.conf を編集してAWSプロファイルやデフォルト設定を変更
+
 キャッシュ関連:
   初回実行時: AWS APIを呼び出してキャッシュに保存
   2回目以降: キャッシュから高速取得（TTL期間内）
@@ -241,6 +274,7 @@ get_pipeline_data() {
     local debug_flag="$2"
     local region="$3"
     local query_filter="$4"
+    local aws_profile="$5"
     
     local cache_args=("-t" "$cache_ttl")
     if [[ "$debug_flag" == "true" ]]; then
@@ -248,6 +282,9 @@ get_pipeline_data() {
     fi
     
     local aws_command=("aws" "codepipeline" "list-pipelines")
+    if [[ -n "$aws_profile" && "$aws_profile" != "default" ]]; then
+        aws_command+=("--profile" "$aws_profile")
+    fi
     if [[ -n "$region" ]]; then
         aws_command+=("--region" "$region")
     fi
@@ -257,9 +294,9 @@ get_pipeline_data() {
     
     # aws_cache.sh を使用してCodePipeline一覧を取得
     if [[ -n "$query_filter" ]]; then
-        echo "🔍 CodePipeline一覧を取得中（フィルター適用・キャッシュ利用）..." >&2
+        echo "🔍 CodePipeline一覧を取得中（クエリフィルター適用）..." >&2
     else
-        echo "🔍 CodePipeline一覧を取得中（キャッシュ利用）..." >&2
+        echo "🔍 CodePipeline一覧を取得中..." >&2
     fi
     
     local pipelines_data
@@ -274,6 +311,7 @@ get_pipeline_details() {
     local cache_ttl="$2"
     local debug_flag="$3"
     local region="$4"
+    local aws_profile="$5"
     
     local cache_args=("-t" "$cache_ttl")
     if [[ "$debug_flag" == "true" ]]; then
@@ -281,6 +319,9 @@ get_pipeline_details() {
     fi
     
     local aws_command=("aws" "codepipeline" "get-pipeline-state" "--name" "$pipeline_name")
+    if [[ -n "$aws_profile" && "$aws_profile" != "default" ]]; then
+        aws_command+=("--profile" "$aws_profile")
+    fi
     if [[ -n "$region" ]]; then
         aws_command+=("--region" "$region")
     fi
@@ -303,6 +344,8 @@ process_pipeline_data() {
     local quiet_mode="$6"
     local analyze_cache="$7"
     local query_filter="$8"
+    local aws_profile="$9"
+    local max_parallel="${10}"
     
     # パイプライン名のリストを取得（クエリフィルター適用時は構造が異なる）
     local pipeline_names
@@ -325,6 +368,7 @@ process_pipeline_data() {
     # 各パイプラインの詳細情報を取得して結合
     local enhanced_data="[]"
     local current_count=0
+    local last_progress_shown=0
     
 
     
@@ -335,16 +379,18 @@ process_pipeline_data() {
     
     # 並列処理用の一時ディレクトリ
     local temp_dir=$(mktemp -d)
-    local max_parallel=15  # 同時実行数を増加（最適化）
+    # max_parallelは引数から取得（設定ファイルの値）
     local current_parallel=0
     
     while IFS= read -r pipeline_name; do
         if [[ -n "$pipeline_name" ]]; then
             current_count=$((current_count + 1))
             
-            # プログレス表示（最適化：頻度を調整）
-            if [[ "$quiet_mode" != "true" ]] && [[ $((current_count % 25)) -eq 0 ]]; then
-                echo "   進捗: $current_count/$total_pipelines 処理済み" >&2
+            # プログレスバー表示（設定ファイルの間隔に従って表示）
+            local progress_interval="${default_progress_interval:-25}"
+            if [[ $((current_count % progress_interval)) -eq 0 ]]; then
+                show_progress "$current_count" "$total_pipelines" "$pipeline_name" "$quiet_mode" "PROCESSING"
+                last_progress_shown=$current_count
             fi
             
             # 並列処理制限
@@ -356,7 +402,16 @@ process_pipeline_data() {
             # バックグラウンドで詳細情報を取得
             {
                 local pipeline_state
-                pipeline_state=$(get_pipeline_details "$pipeline_name" "$cache_ttl" "$debug_flag" "$region")
+                local aws_command=("aws" "codepipeline" "get-pipeline-state" "--name" "$pipeline_name")
+                if [[ -n "$aws_profile" && "$aws_profile" != "default" ]]; then
+                    aws_command+=("--profile" "$aws_profile")
+                fi
+                if [[ -n "$region" ]]; then
+                    aws_command+=("--region" "$region")
+                fi
+                
+                local pipeline_state
+                pipeline_state=$("$AWS_CACHE_SCRIPT" "${cache_args[@]}" --batch-mode -- "${aws_command[@]}" 2>/dev/null || echo "{}")
                 
                 # 基本情報と状態情報を結合
                 local pipeline_info
@@ -380,7 +435,15 @@ process_pipeline_data() {
     # 残りの並列処理完了を待機
     wait
     
+    # 最終プログレスバー表示（完了を明示）
     if [[ "$quiet_mode" != "true" ]]; then
+        # 最後のプログレスバーが表示されていない場合、または完了メッセージを表示
+        if [[ $last_progress_shown -lt $total_pipelines ]]; then
+            show_progress "$total_pipelines" "$total_pipelines" "完了" "$quiet_mode" "COMPLETED"
+        else
+            # 最後のプログレスバーは表示されているが、完了メッセージで上書き
+            show_progress "$total_pipelines" "$total_pipelines" "完了" "$quiet_mode" "COMPLETED"
+        fi
         echo "🔄 結果を結合中..." >&2
     fi
     
@@ -517,14 +580,39 @@ format_json() {
 
 # メイン処理
 main() {
-    local format="table"
-    local status_filter="ALL"
-    local cache_ttl="1800"  # 30分（パイプライン状況は頻繁に変わらないため）
+    # 設定ファイルを読み込み（デフォルト値を設定）
+    local aws_profile="${AWS_PIPELINES_PROFILE:-default}"
+    local default_region="${AWS_REGION:-}"
+    local default_cache_ttl="${CACHE_TTL:-1800}"
+    local default_format="${DISPLAY_FORMAT:-table}"
+    local default_quiet="${DISPLAY_QUIET:-false}"
+    local default_max_parallel="${PERFORMANCE_MAX_PARALLEL:-15}"
+    local default_progress_interval="${DISPLAY_PROGRESS_INTERVAL:-25}"
+    local default_query="${PIPELINES_DEFAULT_QUERY:-}"
+    local default_status="${PIPELINES_DEFAULT_STATUS:-ALL}"
+    
+    # 設定ファイルが存在する場合は読み込み
+    if load_config "$CONFIG_FILE"; then
+        aws_profile="${AWS_PIPELINES_PROFILE:-$aws_profile}"
+        default_region="${AWS_REGION:-$default_region}"
+        default_cache_ttl="${CACHE_TTL:-$default_cache_ttl}"
+        default_format="${DISPLAY_FORMAT:-$default_format}"
+        default_quiet="${DISPLAY_QUIET:-$default_quiet}"
+        default_max_parallel="${PERFORMANCE_MAX_PARALLEL:-$default_max_parallel}"
+        default_progress_interval="${DISPLAY_PROGRESS_INTERVAL:-$default_progress_interval}"
+        default_query="${PIPELINES_DEFAULT_QUERY:-$default_query}"
+        default_status="${PIPELINES_DEFAULT_STATUS:-$default_status}"
+    fi
+    
+    # 変数を初期化（設定ファイルの値またはデフォルト値）
+    local format="$default_format"
+    local status_filter="$default_status"
+    local cache_ttl="$default_cache_ttl"
     local debug_flag="false"
-    local region=""
-    local quiet_mode="false"
+    local region="$default_region"
+    local quiet_mode="$default_quiet"
     local analyze_cache="false"
-    local query_filter=""
+    local query_filter="$default_query"
     
     # 引数解析
     while [[ $# -gt 0 ]]; do
@@ -589,7 +677,7 @@ main() {
     
     # パイプラインデータを取得
     local pipelines_json
-    pipelines_json=$(get_pipeline_data "$cache_ttl" "$debug_flag" "$region" "$query_filter")
+    pipelines_json=$(get_pipeline_data "$cache_ttl" "$debug_flag" "$region" "$query_filter" "$aws_profile")
     
     # 結果が空の場合
     local pipeline_count
@@ -610,7 +698,7 @@ main() {
     else
         # パイプラインデータを処理
         local processed_data
-        processed_data=$(process_pipeline_data "$pipelines_json" "$status_filter" "$cache_ttl" "$debug_flag" "$region" "$quiet_mode" "$analyze_cache" "$query_filter")
+        processed_data=$(process_pipeline_data "$pipelines_json" "$status_filter" "$cache_ttl" "$debug_flag" "$region" "$quiet_mode" "$analyze_cache" "$query_filter" "$aws_profile" "$default_max_parallel")
         
         # フィルター後の結果が空の場合
         if [[ "$(echo "$processed_data" | jq 'length')" == "0" ]]; then
