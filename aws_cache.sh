@@ -2,6 +2,7 @@
 
 # AWS CLI Cache System
 # AWS CLIのAPIコールレスポンスをローカルにキャッシュして再利用するシステム
+# キャッシュは AWS context (profile + region) のハッシュ値でディレクトリを階層化して保存
 
 # 設定
 CACHE_DIR="${AWS_CACHE_DIR:-./aws_cache}"
@@ -45,6 +46,10 @@ AWS CLI Cache System
   $0 --list
   $0 --clear ec2
   $0 --test "aws s3api list-buckets"   # キャッシュ存在確認
+
+キャッシュ構造:
+  キャッシュは AWS context (profile + region) のハッシュ値でディレクトリを階層化
+  例: ./aws_cache/a1b2c3d4.../cache_key.json
 
 EOF
 }
@@ -116,10 +121,38 @@ generate_cache_key() {
     echo -n "$cache_input" | md5 -q 2>/dev/null || echo -n "$cache_input" | md5sum | cut -d' ' -f1
 }
 
-# キャッシュファイルのパスを取得
+# AWS contextのハッシュを生成
+generate_context_hash() {
+    local aws_context="$1"
+    echo -n "$aws_context" | md5 -q 2>/dev/null || echo -n "$aws_context" | md5sum | cut -d' ' -f1
+}
+
+# キャッシュファイルのパスを取得（階層化構造）
 get_cache_file() {
     local cache_key="$1"
-    echo "$CACHE_DIR/${cache_key}.json"
+    local aws_context
+    
+    # バッチモードの場合、AWS設定を一度だけ取得
+    if [[ "$batch_mode" == "true" ]]; then
+        if [[ -z "$BATCH_AWS_CONTEXT" ]]; then
+            BATCH_AWS_CONTEXT=$(get_aws_context)
+        fi
+        aws_context="$BATCH_AWS_CONTEXT"
+    else
+        aws_context=$(get_aws_context)
+    fi
+    
+    # AWS contextのハッシュでディレクトリを作成
+    local context_hash
+    context_hash=$(generate_context_hash "$aws_context")
+    local context_dir="$CACHE_DIR/$context_hash"
+    
+    # ディレクトリが存在しない場合は作成
+    mkdir -p "$context_dir"
+    
+    debug_log "📁 キャッシュディレクトリ: $context_dir (AWS設定: $aws_context)"
+    
+    echo "$context_dir/${cache_key}.json"
 }
 
 # キャッシュが有効かチェック
@@ -218,52 +251,138 @@ EOF
 # キャッシュ一覧を表示
 list_cache() {
     echo "📋 キャッシュ一覧:"
+    echo "📂 キャッシュディレクトリ: $CACHE_DIR"
     
-    if [[ ! -d "$CACHE_DIR" ]] || [[ -z "$(ls -A "$CACHE_DIR"/*.json 2>/dev/null)" ]]; then
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        echo "  キャッシュディレクトリが存在しません"
+        return
+    fi
+    
+    # ディレクトリサイズを取得
+    local cache_size
+    if command -v du >/dev/null 2>&1; then
+        cache_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
+        echo "💾 ディレクトリサイズ: $cache_size"
+    fi
+    
+    # ファイル数とコンテキスト数を取得
+    local total_files
+    total_files=$(find "$CACHE_DIR" -name "*.json" -type f 2>/dev/null | wc -l | tr -d ' ')
+    local context_dirs
+    context_dirs=$(find "$CACHE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    
+    echo "📄 キャッシュファイル数: $total_files"
+    echo "🗂️  AWS コンテキスト数: $context_dirs"
+    echo ""
+    
+    local found_cache=false
+    
+    # 階層化されたディレクトリを検索
+    for context_dir in "$CACHE_DIR"/*; do
+        if [[ -d "$context_dir" ]]; then
+            local context_hash=$(basename "$context_dir")
+            
+            # 各コンテキストディレクトリ内のJSONファイルを検索
+            for cache_file in "$context_dir"/*.json; do
+                if [[ -f "$cache_file" ]]; then
+                    found_cache=true
+                    local command_str
+                    local timestamp
+                    local ttl
+                    local aws_context
+                    
+                    command_str=$(jq -r '.command | join(" ")' "$cache_file" 2>/dev/null)
+                    aws_context=$(jq -r '.aws_context // "unknown"' "$cache_file" 2>/dev/null)
+                    timestamp=$(jq -r '.timestamp' "$cache_file" 2>/dev/null)
+                    ttl=$(jq -r '.ttl' "$cache_file" 2>/dev/null)
+                    
+                    if [[ "$command_str" != "null" ]]; then
+                        local status="期限切れ"
+                        if is_cache_valid "$cache_file" "$ttl"; then
+                            status="有効"
+                        fi
+                        
+                        # タイムスタンプを読みやすい形式に変換
+                        local formatted_time=""
+                        if [[ "$timestamp" != "null" && -n "$timestamp" ]]; then
+                            # ISO形式の日時を読みやすい形式に変換
+                            if command -v date >/dev/null 2>&1; then
+                                if [[ "$OSTYPE" == "darwin"* ]]; then
+                                    # macOS
+                                    formatted_time=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${timestamp%+*}" "+%Y/%m/%d %H:%M:%S" 2>/dev/null || echo "$timestamp")
+                                else
+                                    # Linux
+                                    formatted_time=$(date -d "$timestamp" "+%Y/%m/%d %H:%M:%S" 2>/dev/null || echo "$timestamp")
+                                fi
+                            else
+                                formatted_time="$timestamp"
+                            fi
+                        else
+                            formatted_time="不明"
+                        fi
+                        
+                        echo "  📁 $context_hash/$(basename "$cache_file"): $command_str [$aws_context] ($status, $formatted_time)"
+                    fi
+                fi
+            done
+        fi
+    done
+    
+    if [[ "$found_cache" == "false" ]]; then
         echo "  キャッシュファイルがありません"
         return
     fi
     
-    for cache_file in "$CACHE_DIR"/*.json; do
-        if [[ -f "$cache_file" ]]; then
-            local command_str
-            local timestamp
-            local ttl
-            
-            command_str=$(jq -r '.command | join(" ")' "$cache_file" 2>/dev/null)
-            aws_context=$(jq -r '.aws_context // "unknown"' "$cache_file" 2>/dev/null)
-            timestamp=$(jq -r '.timestamp' "$cache_file" 2>/dev/null)
-            ttl=$(jq -r '.ttl' "$cache_file" 2>/dev/null)
-            
-            if [[ "$command_str" != "null" ]]; then
-                local status="期限切れ"
-                if is_cache_valid "$cache_file" "$ttl"; then
-                    status="有効"
-                fi
-                
-                # タイムスタンプを読みやすい形式に変換
-                local formatted_time=""
-                if [[ "$timestamp" != "null" && -n "$timestamp" ]]; then
-                    # ISO形式の日時を読みやすい形式に変換
-                    if command -v date >/dev/null 2>&1; then
-                        if [[ "$OSTYPE" == "darwin"* ]]; then
-                            # macOS
-                            formatted_time=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${timestamp%+*}" "+%Y/%m/%d %H:%M:%S" 2>/dev/null || echo "$timestamp")
-                        else
-                            # Linux
-                            formatted_time=$(date -d "$timestamp" "+%Y/%m/%d %H:%M:%S" 2>/dev/null || echo "$timestamp")
-                        fi
+    # 3日以上古いキャッシュファイルをチェック
+    local old_files=()
+    local three_days_ago=$(($(date +%s) - 259200))  # 3日 = 259200秒
+    
+    for context_dir in "$CACHE_DIR"/*; do
+        if [[ -d "$context_dir" ]]; then
+            for cache_file in "$context_dir"/*.json; do
+                if [[ -f "$cache_file" ]]; then
+                    local file_time
+                    if [[ "$OSTYPE" == "darwin"* ]]; then
+                        # macOS
+                        file_time=$(stat -f %m "$cache_file")
                     else
-                        formatted_time="$timestamp"
+                        # Linux
+                        file_time=$(stat -c %Y "$cache_file")
                     fi
-                else
-                    formatted_time="不明"
+                    
+                    if [[ $file_time -lt $three_days_ago ]]; then
+                        old_files+=("$cache_file")
+                    fi
                 fi
-                
-                echo "  $(basename "$cache_file"): $command_str [$aws_context] ($status, $formatted_time)"
-            fi
+            done
         fi
     done
+    
+    # 3日以上古いファイルがある場合、削除確認
+    if [[ ${#old_files[@]} -gt 0 ]]; then
+        echo ""
+        echo "🗑️  3日以上古いキャッシュファイルが ${#old_files[@]} 個見つかりました。"
+        echo "これらのファイルを削除しますか？ (y/yes で削除、その他で無視)"
+        read -r response
+        
+        if [[ "$response" == "y" || "$response" == "yes" ]]; then
+            local deleted_count=0
+            for old_file in "${old_files[@]}"; do
+                if [[ -f "$old_file" ]]; then
+                    debug_log "🗑️  削除: $old_file"
+                    rm -f "$old_file"
+                    deleted_count=$((deleted_count + 1))
+                fi
+            done
+            
+            # 空になったディレクトリも削除
+            find "$CACHE_DIR" -type d -empty -not -path "$CACHE_DIR" -exec rmdir {} \; 2>/dev/null || true
+            
+            echo "✅ $deleted_count 個の古いキャッシュファイルを削除しました。"
+        else
+            echo "❌ キャッシュファイルの削除をキャンセルしました。"
+        fi
+    fi
 }
 
 # キャッシュをクリア
@@ -278,22 +397,26 @@ clear_cache() {
         # パターンマッチング方式を選択
         if [[ "$pattern" =~ ^[a-f0-9]{32}$ ]]; then
             # MD5ハッシュの場合：ファイル名で直接マッチング
-            find "$CACHE_DIR" -name "*${pattern}*.json" -type f -delete
-            deleted_count=$(find "$CACHE_DIR" -name "*${pattern}*.json" -type f | wc -l)
+            find "$CACHE_DIR" -name "*${pattern}*.json" -type f -exec rm -f {} \;
+            deleted_count=$(find "$CACHE_DIR" -name "*${pattern}*.json" -type f 2>/dev/null | wc -l)
         else
-            # コマンド内容でマッチング：キャッシュファイルの中身を検索
-            for cache_file in "$CACHE_DIR"/*.json; do
-                if [[ -f "$cache_file" ]]; then
-                    # jqでコマンド内容を確認
-                    local command_str
-                    command_str=$(jq -r '.command | join(" ")' "$cache_file" 2>/dev/null || echo "")
-                    
-                    # パターンがコマンド内容に含まれているかチェック
-                    if [[ "$command_str" == *"$pattern"* ]]; then
-                        debug_log "🗑️  削除: $cache_file (コマンド: $command_str)"
-                        rm -f "$cache_file"
-                        deleted_count=$((deleted_count + 1))
-                    fi
+            # コマンド内容でマッチング：階層化されたキャッシュファイルの中身を検索
+            for context_dir in "$CACHE_DIR"/*; do
+                if [[ -d "$context_dir" ]]; then
+                    for cache_file in "$context_dir"/*.json; do
+                        if [[ -f "$cache_file" ]]; then
+                            # jqでコマンド内容を確認
+                            local command_str
+                            command_str=$(jq -r '.command | join(" ")' "$cache_file" 2>/dev/null || echo "")
+                            
+                            # パターンがコマンド内容に含まれているかチェック
+                            if [[ "$command_str" == *"$pattern"* ]]; then
+                                debug_log "🗑️  削除: $cache_file (コマンド: $command_str)"
+                                rm -f "$cache_file"
+                                deleted_count=$((deleted_count + 1))
+                            fi
+                        fi
+                    done
                 fi
             done
         fi
@@ -303,7 +426,13 @@ clear_cache() {
         debug_log "🗑️  全キャッシュを削除中..."
         local total_files
         total_files=$(find "$CACHE_DIR" -name "*.json" -type f | wc -l)
-        rm -f "$CACHE_DIR"/*.json
+        
+        # 階層化されたディレクトリ内のファイルを削除
+        find "$CACHE_DIR" -name "*.json" -type f -exec rm -f {} \;
+        
+        # 空になったディレクトリも削除
+        find "$CACHE_DIR" -type d -empty -not -path "$CACHE_DIR" -exec rmdir {} \; 2>/dev/null || true
+        
         # AWS設定キャッシュも削除
         rm -f "$AWS_CONTEXT_CACHE_FILE"
         debug_log "✅ $total_files 個のキャッシュファイルを削除しました"
