@@ -32,7 +32,7 @@ AWS CLI Cache System
   -f, --force          強制的にキャッシュを更新
   -l, --list           キャッシュ一覧を表示
   -c, --clear [PATTERN] キャッシュをクリア（パターン指定可能）
-  --test COMMAND       指定コマンドのキャッシュ存在・有効性をテスト
+  --test -- COMMAND    指定コマンドのキャッシュ存在・有効性をテスト（戻り値で判定）
   --batch-mode         バッチ処理モード（AWS設定取得を最適化）
   -d, --debug          デバッグモード（詳細ログを表示）
   -h, --help           このヘルプを表示
@@ -45,7 +45,19 @@ AWS CLI Cache System
   $0 --batch-mode -- aws s3api list-buckets  # バッチ処理モード
   $0 --list
   $0 --clear ec2
-  $0 --test "aws s3api list-buckets"   # キャッシュ存在確認
+  $0 --test -- aws s3api list-buckets   # キャッシュ存在確認
+  $0 --test -- aws ec2 describe-vpcs    # キャッシュ存在確認
+
+テストコマンドの戻り値:
+  終了コード 0: キャッシュが存在し、TTLが有効
+  終了コード 1: キャッシュが存在しないか、TTLが期限切れ
+  
+  シェルスクリプトでの使用例:
+    if $0 --test -- aws s3api list-buckets; then
+      echo "キャッシュが有効"
+    else
+      echo "キャッシュが無効"
+    fi
 
 キャッシュ構造:
   キャッシュは AWS context (profile + region) のハッシュ値でディレクトリを階層化
@@ -589,8 +601,16 @@ main() {
                 ;;
             --test)
                 action="test"
-                test_command="$2"
-                shift 2
+                # 次の引数は -- である必要がある
+                if [[ "$2" == "--" ]]; then
+                    shift 2  # --test と -- をスキップ
+                    test_command="$*"  # 残りの全ての引数を結合
+                    break  # 引数解析を終了
+                else
+                    echo "❌ --test オプションには -- が必要です" >&2
+                    echo "使用方法: $0 --test -- <aws-cli-command>" >&2
+                    exit 1
+                fi
                 ;;
             --batch-mode)
                 batch_mode="true"
