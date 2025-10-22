@@ -441,7 +441,15 @@ main() {
                     account_id: $account_id,
                     account_name: $account_name,
                     pipeline_name: $pipeline_name,
-                    pipeline_status: ($pipeline_state.stageStates[0].latestExecution.status // null),
+                    pipeline_status: (
+                        [$pipeline_state.stageStates[]?.latestExecution?.status] as $statuses |
+                        if ($statuses | map(select(. == "InProgress")) | length) > 0 then "InProgress"
+                        elif ($statuses | map(select(. == "Failed")) | length) > 0 then "Failed"
+                        elif ($statuses | map(select(. == "Stopped")) | length) > 0 then "Stopped"
+                        elif ($statuses | map(select(. == "Succeeded")) | length) == ($statuses | length) and ($statuses | length) > 0 then "Succeeded"
+                        else "Unknown"
+                        end
+                    ),
                     pipeline_updated: ($pipeline_state.updated // null),
                     last_execution_time: ($pipeline_executions.pipelineExecutionSummaries[0].lastUpdateTime // null),
                     last_execution_status: ($pipeline_executions.pipelineExecutionSummaries[0].status // null)
